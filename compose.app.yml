@@ -1,0 +1,8 @@
+name: isec6000-app-demo
+
+services:
+  app:
+    image: bhrugusharma/isec6000-assessment2@sha256:690836483e89429e303087e692d4e342bf45ba18dbc726ab26cc396b1b855482
+    ports:
+      - "127.0.0.1:3000:8080"
+    restart: unless-stopped
