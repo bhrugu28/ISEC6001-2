@@ -1,0 +1,12 @@
+# Local settings and secrets
+.env
+.env.*
+!.env.example
+.secrets/
+*.pem
+*.key
+
+# Generated files
+*.log
+node_modules/
+evidence/raw/

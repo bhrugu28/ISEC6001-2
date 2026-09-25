@@ -1,0 +1,210 @@
+name: isec6000-a2
+
+# Limit container log growth.
+# Jenkins build retention will be configured separately.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  jenkins:
+    # Controller manages jobs. Builds run on the separate agent.
+    build:
+      context: ./jenkins
+    image: isec6000/jenkins-controller:local
+    user: "1000:1000"
+    restart: unless-stopped
+
+    environment:
+      # Keep Java heap usage within the container memory limit.
+      JAVA_OPTS: "-Xms256m -Xmx1024m"
+
+    ports:
+      # Make the Jenkins interface accessible from this computer only.
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      # Preserve accounts, credentials, jobs and build records.
+      - jenkins_home:/var/jenkins_home
+
+    networks:
+      - control
+
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    mem_limit: 1536m
+    cpus: 2.0
+
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --output
+        - /dev/null
+        - http://localhost:8080/login
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 18
+
+    logging: *default-logging
+
+  dind:
+    # Dedicated Docker daemon for pipeline builds.
+    image: docker:29-dind
+    hostname: docker
+
+    # Required for this DinD setup.
+    privileged: true
+    restart: unless-stopped
+
+    environment:
+      # Generate certificates for authenticated Docker connections.
+      DOCKER_TLS_CERTDIR: /certs
+
+    volumes:
+      # Preserve images, build cache and container data.
+      - dind_storage:/var/lib/docker
+      - dind_containerd:/var/lib/containerd
+
+      # Keep CA/server certificates separate from client certificates.
+      - dind_tls:/certs
+      - docker_client_certs:/certs/client
+
+      # Nested build containers need the same workspace path as the agent.
+      - type: volume
+        source: agent_workspace
+        target: /home/jenkins/agent
+        volume:
+          nocopy: true
+
+    networks:
+      build:
+        aliases:
+          - docker
+
+    # Docker API ports are not published to the host.
+    mem_limit: 4g
+    cpus: 6.0
+
+    healthcheck:
+      test:
+        - CMD
+        - docker
+        - --host=unix:///var/run/docker.sock
+        - info
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 12
+
+    logging: *default-logging
+
+  workspace-init:
+    # Assign workspace ownership before the nonroot agent starts.
+    # This service exits after completing the ownership change.
+    image: alpine:3.22
+    user: "0:0"
+    command: ["chown", "1000:1000", "/workspace"]
+    restart: "no"
+
+    network_mode: none
+    read_only: true
+
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+
+    volumes:
+      - agent_workspace:/workspace
+
+    logging: *default-logging
+
+  agent:
+    # Worker executes pipeline tasks and sends Docker commands to DinD.
+    build:
+      context: ./agent
+    image: isec6000/jenkins-agent:local
+    user: "1000:1000"
+    init: true
+    restart: unless-stopped
+
+    depends_on:
+      jenkins:
+        condition: service_healthy
+      dind:
+        condition: service_healthy
+      workspace-init:
+        condition: service_completed_successfully
+
+    environment:
+      # Connect to Jenkins through the internal control network.
+      JENKINS_URL: http://jenkins:8080/
+      JENKINS_AGENT_NAME: docker-agent
+      JENKINS_AGENT_WORKDIR: /home/jenkins/agent
+
+      # WebSocket avoids needing an additional published agent port.
+      JENKINS_WEB_SOCKET: "true"
+      JAVA_OPTS: "-Xms128m -Xmx512m"
+
+      # Connect to the dedicated Docker daemon using TLS.
+      DOCKER_HOST: tcp://docker:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: /certs/client
+
+    secrets:
+      - jenkins_agent_secret
+
+    volumes:
+      # Share build files with DinD.
+      - agent_workspace:/home/jenkins/agent
+
+      # Allow the agent to read its Docker client certificates.
+      - docker_client_certs:/certs/client:ro
+
+    networks:
+      - control
+      - build
+
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    mem_limit: 1g
+    cpus: 2.0
+
+    logging: *default-logging
+
+networks:
+  # Communication between Jenkins and the agent.
+  control:
+    driver: bridge
+
+  # Communication between the agent and DinD.
+  build:
+    driver: bridge
+
+volumes:
+  jenkins_home:
+  dind_storage:
+  dind_containerd:
+  dind_tls:
+  docker_client_certs:
+  agent_workspace:
+
+secrets:
+  # Created locally using scripts/set-agent-secret.sh.
+  # The .secrets directory must be excluded from Git.
+  jenkins_agent_secret:
+    file: ./.secrets/jenkins_agent_secret
